@@ -1,4 +1,5 @@
 import pytest
+from sqlalchemy.engine import make_url
 
 from app.config import get_database_url
 
@@ -14,6 +15,10 @@ from app.config import get_database_url
             "postgresql://user:pass@order-db:5432/order_db",
             "postgresql+asyncpg://user:pass@order-db:5432/order_db",
         ),
+        (
+            "postgresql+psycopg2://user:pass@order-db:5432/order_db",
+            "postgresql+asyncpg://user:pass@order-db:5432/order_db",
+        ),
     ],
 )
 def test_database_url_uses_asyncpg_driver(
@@ -23,4 +28,6 @@ def test_database_url_uses_asyncpg_driver(
 ) -> None:
     monkeypatch.setenv("DATABASE_URL", configured_url)
 
-    assert get_database_url() == expected_url
+    database_url = get_database_url()
+    assert database_url == expected_url
+    assert make_url(database_url).drivername == "postgresql+asyncpg"

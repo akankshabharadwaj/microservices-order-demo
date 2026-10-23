@@ -8,12 +8,19 @@ def get_database_url() -> str:
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL environment variable is required")
-    if database_url.startswith("postgresql+psycopg://"):
-        return database_url.replace("postgresql+psycopg://", "postgresql+asyncpg://", 1)
-    if database_url.startswith("postgres://"):
-        return database_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    if database_url.startswith("postgresql://"):
-        return database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    for scheme in (
+        "postgresql+psycopg://",
+        "postgresql+psycopg2://",
+        "postgresql://",
+        "postgres://",
+    ):
+        if database_url.startswith(scheme):
+            return database_url.replace(scheme, "postgresql+asyncpg://", 1)
+    if database_url.startswith("postgresql+"):
+        raise RuntimeError(
+            "DATABASE_URL must use the asyncpg driver, such as "
+            "postgresql+asyncpg://user:password@host:5432/database"
+        )
     return database_url
 
 
