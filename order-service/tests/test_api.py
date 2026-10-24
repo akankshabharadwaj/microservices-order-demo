@@ -13,23 +13,9 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
-from app.main import app, get_inventory_client, get_order_event_publisher
+from app.main import app, get_order_event_publisher
 from app.messaging import RabbitMQPublishError
-from app.models import Base, Order
-
-
-class InventoryStub:
-    def __init__(self) -> None:
-        self.status_code = 200
-        self.payload: object = {"price": "19.99"}
-        self.error: httpx.HTTPError | None = None
-        self.requests: list[httpx.Request] = []
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        if self.error is not None:
-            raise self.error
-        return httpx.Response(self.status_code, json=self.payload)
+from app.models import Base, Order, Product
 
 
 class EventPublisherStub:
@@ -77,22 +63,6 @@ async def database() -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
 
 
 @pytest_asyncio.fixture
-async def inventory_stub() -> AsyncGenerator[InventoryStub, None]:
-    stub = InventoryStub()
-
-    async def override_inventory_client() -> AsyncGenerator[httpx.AsyncClient, None]:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(stub),
-            base_url="http://inventory.test",
-        ) as inventory_client:
-            yield inventory_client
-
-    app.dependency_overrides[get_inventory_client] = override_inventory_client
-    yield stub
-    app.dependency_overrides.clear()
-
-
-@pytest_asyncio.fixture
 async def event_publisher() -> AsyncGenerator[EventPublisherStub, None]:
     stub = EventPublisherStub()
 
@@ -107,10 +77,19 @@ async def event_publisher() -> AsyncGenerator[EventPublisherStub, None]:
 @pytest_asyncio.fixture
 async def client(
     database: async_sessionmaker[AsyncSession],
-    inventory_stub: InventoryStub,
     event_publisher: EventPublisherStub,
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
-    del database, inventory_stub, event_publisher
+    async with database() as session:
+        session.add(
+            Product(
+                id=12,
+                name="Widget",
+                price=Decimal("19.99"),
+                available_quantity=3,
+            )
+        )
+        await session.commit()
+
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
@@ -119,99 +98,109 @@ async def client(
 
 
 @pytest.mark.asyncio
-async def test_create_order_reserves_inventory_and_calculates_total(
+async def test_product_create_list_and_get(client: httpx.AsyncClient) -> None:
+    create_response = await client.post(
+        "/products",
+        json={"name": "  Mouse ", "price": "12.50", "available_quantity": 8},
+    )
+    assert create_response.status_code == 201
+    created = create_response.json()
+    assert created["name"] == "Mouse"
+    assert Decimal(created["price"]) == Decimal("12.50")
+
+    list_response = await client.get("/products")
+    assert list_response.status_code == 200
+    assert len(list_response.json()) == 2
+
+    get_response = await client.get(f"/products/{created['id']}")
+    assert get_response.status_code == 200
+    assert get_response.json() == created
+
+
+@pytest.mark.asyncio
+async def test_create_order_decrements_stock_and_publishes_event(
     client: httpx.AsyncClient,
-    inventory_stub: InventoryStub,
+    database: async_sessionmaker[AsyncSession],
     event_publisher: EventPublisherStub,
 ) -> None:
-    response = await client.post("/orders", json={"product_id": 12, "quantity": 3})
+    response = await client.post("/orders", json={"product_id": 12, "quantity": 2})
 
     assert response.status_code == 201
     order = response.json()
     assert order["product_id"] == 12
-    assert order["quantity"] == 3
-    assert Decimal(order["total_amount"]) == Decimal("59.97")
+    assert order["quantity"] == 2
+    assert Decimal(order["total_amount"]) == Decimal("39.98")
     assert order["status"] == "created"
     assert order["created_at"]
-    assert len(inventory_stub.requests) == 1
-    assert str(inventory_stub.requests[0].url) == (
-        "http://inventory.test/products/12/reserve"
-    )
-    assert inventory_stub.requests[0].method == "POST"
-    assert inventory_stub.requests[0].content == b'{"quantity":3}'
     assert event_publisher.events == [
         {
             "event_type": "order.created",
             "order_id": order["id"],
             "product_id": 12,
-            "quantity": 3,
-            "total_amount": 59.97,
+            "quantity": 2,
+            "total_amount": 39.98,
         }
     ]
+    async with database() as session:
+        product = await session.get(Product, 12)
+    assert product is not None and product.available_quantity == 1
 
     list_response = await client.get("/orders")
     assert list_response.status_code == 200
     assert len(list_response.json()) == 1
-
     get_response = await client.get(f"/orders/{order['id']}")
     assert get_response.status_code == 200
     assert get_response.json() == order
-
-    missing_response = await client.get("/orders/999999")
-    assert missing_response.status_code == 404
+    assert (await client.get("/orders/999999")).status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_inventory_rejection_does_not_create_order(
+async def test_missing_product_does_not_create_order(
     client: httpx.AsyncClient,
-    inventory_stub: InventoryStub,
-    event_publisher: EventPublisherStub,
     database: async_sessionmaker[AsyncSession],
+    event_publisher: EventPublisherStub,
 ) -> None:
-    inventory_stub.status_code = 409
-    inventory_stub.payload = {"detail": "Insufficient stock"}
+    response = await client.post("/orders", json={"product_id": 999, "quantity": 1})
 
-    response = await client.post("/orders", json={"product_id": 12, "quantity": 3})
-
-    assert response.status_code == 409
-    assert response.json()["detail"] == "Insufficient stock"
-    assert event_publisher.events == []
+    assert response.status_code == 404
     async with database() as session:
         count = await session.scalar(select(func.count()).select_from(Order))
     assert count == 0
+    assert event_publisher.events == []
 
 
 @pytest.mark.asyncio
-async def test_inventory_unavailable_returns_service_unavailable(
+async def test_insufficient_stock_does_not_create_order(
     client: httpx.AsyncClient,
-    inventory_stub: InventoryStub,
+    database: async_sessionmaker[AsyncSession],
+    event_publisher: EventPublisherStub,
 ) -> None:
-    inventory_stub.error = httpx.ConnectError(
-        "connection failed",
-        request=httpx.Request("POST", "http://inventory.test/products/12/reserve"),
-    )
+    response = await client.post("/orders", json={"product_id": 12, "quantity": 4})
 
-    response = await client.post("/orders", json={"product_id": 12, "quantity": 3})
-
-    assert response.status_code == 503
-    assert response.json()["detail"] == "Inventory Service is unavailable"
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Insufficient stock"
+    async with database() as session:
+        count = await session.scalar(select(func.count()).select_from(Order))
+        product = await session.get(Product, 12)
+    assert count == 0
+    assert product is not None and product.available_quantity == 3
+    assert event_publisher.events == []
 
 
 @pytest.mark.asyncio
-async def test_invalid_order_is_rejected_before_inventory_call(
+async def test_invalid_order_is_rejected(
     client: httpx.AsyncClient,
-    inventory_stub: InventoryStub,
+    event_publisher: EventPublisherStub,
 ) -> None:
     response = await client.post("/orders", json={"product_id": 0, "quantity": 0})
 
     assert response.status_code == 422
-    assert inventory_stub.requests == []
+    assert event_publisher.events == []
 
 
 @pytest.mark.asyncio
 async def test_health_check(client: httpx.AsyncClient) -> None:
     response = await client.get("/health")
-
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
@@ -224,7 +213,7 @@ async def test_broker_failure_is_reported_after_order_is_saved(
 ) -> None:
     event_publisher.fail = True
 
-    response = await client.post("/orders", json={"product_id": 12, "quantity": 3})
+    response = await client.post("/orders", json={"product_id": 12, "quantity": 1})
 
     assert response.status_code == 503
     assert response.json()["detail"] == (
@@ -232,4 +221,6 @@ async def test_broker_failure_is_reported_after_order_is_saved(
     )
     async with database() as session:
         count = await session.scalar(select(func.count()).select_from(Order))
+        product = await session.get(Product, 12)
     assert count == 1
+    assert product is not None and product.available_quantity == 2

@@ -18,14 +18,6 @@ def get_database_url() -> str:
     return database_url
 
 
-def get_inventory_service_url() -> str:
-    """Return the base URL for the Inventory Service."""
-    service_url = os.getenv("INVENTORY_SERVICE_URL")
-    if not service_url:
-        raise RuntimeError("INVENTORY_SERVICE_URL environment variable is required")
-    return service_url.rstrip("/")
-
-
 def get_rabbitmq_url() -> str:
     """Return the configured RabbitMQ connection URL."""
     rabbitmq_url = os.getenv("RABBITMQ_URL")

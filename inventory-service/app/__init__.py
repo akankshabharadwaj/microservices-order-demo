@@ -1,1 +1,0 @@
-"""Inventory Service application package."""
