@@ -53,8 +53,9 @@ async def init_db() -> None:
             return
         except (SQLAlchemyError, TimeoutError, OSError) as exc:
             logger.warning(
-                "Database initialization failed (%s); retrying in %.1f seconds",
+                "Database initialization failed (%s: %s); retrying in %.1f seconds",
                 type(exc).__name__,
+                exc,
                 retry_delay,
             )
             await asyncio.sleep(retry_delay)
