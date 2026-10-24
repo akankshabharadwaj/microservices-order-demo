@@ -20,6 +20,10 @@ from app.config import get_database_url
             "postgresql+psycopg2://user:pass@inventory-db:5432/inventory_db",
             "postgresql+asyncpg://user:pass@inventory-db:5432/inventory_db",
         ),
+        (
+            "postgresql+custom_driver://user:pass@inventory-db:5432/inventory_db",
+            "postgresql+asyncpg://user:pass@inventory-db:5432/inventory_db",
+        ),
     ],
 )
 def test_database_url_uses_asyncpg_driver(

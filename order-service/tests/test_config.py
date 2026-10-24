@@ -19,6 +19,10 @@ from app.config import get_database_url
             "postgresql+psycopg2://user:pass@order-db:5432/order_db",
             "postgresql+asyncpg://user:pass@order-db:5432/order_db",
         ),
+        (
+            "postgresql+custom_driver://user:pass@order-db:5432/order_db",
+            "postgresql+asyncpg://user:pass@order-db:5432/order_db",
+        ),
     ],
 )
 def test_database_url_uses_asyncpg_driver(

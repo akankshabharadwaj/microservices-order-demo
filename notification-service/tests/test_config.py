@@ -19,6 +19,10 @@ from app.config import get_database_url
             "postgresql+psycopg2://user:pass@notification-db:5432/notification_db",
             "postgresql+asyncpg://user:pass@notification-db:5432/notification_db",
         ),
+        (
+            "postgresql+custom_driver://user:pass@notification-db:5432/notification_db",
+            "postgresql+asyncpg://user:pass@notification-db:5432/notification_db",
+        ),
     ],
 )
 def test_database_url_uses_asyncpg_driver(
