@@ -19,8 +19,8 @@ Each microservice has a separate PostgreSQL container, connection-string environ
 
 ## Local setup
 
-1. Copy `.env.example` to `.env`.
-2. Set unique, strong values for the PostgreSQL and RabbitMQ credentials, and set each database URL to use its corresponding Docker service name (for example, `order-db:5432`).
+1. Copy `.env.example` to `.env` (`Copy-Item .env.example .env` in PowerShell).
+2. Fill in the required values in `.env`. Generate strong credentials rather than using example/default passwords. Set each database URL to use its corresponding Docker service name (for example, `order-db:5432`); set `RABBITMQ_URL` to `amqp://<RABBITMQ_USER>:<RABBITMQ_PASSWORD>@rabbitmq:5672/`.
 3. Start the stack with `docker compose up --build`.
 4. Access the gateway at `http://localhost:8080`.
 
