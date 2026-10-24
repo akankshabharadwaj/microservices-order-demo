@@ -1,27 +1,109 @@
-# Order Processing System
+# Mini Order Processing System
 
-Educational microservices application using Python 3.12, FastAPI, PostgreSQL, RabbitMQ, Nginx, Docker, and Docker Compose.
+A small classroom example of two FastAPI services communicating over REST. It uses Python 3.12, async SQLAlchemy, PostgreSQL, Nginx, and Docker Compose.
 
-## Services
+## Architecture
 
-- `order-service`: order API and orchestration.
-- Product and stock management are handled by Order Service to keep the demo small.
-- `notification-service`: asynchronous order notifications.
-- `gateway`: Nginx API gateway.
+```text
+Client
+  |
+  v
+Nginx API Gateway (localhost:8080)
+  |
+  v
+Order Service ------> order-db
+  |
+  | HTTP POST /notifications
+  v
+Notification Service ------> notification-db
+```
 
-Order Service stores products, stock, and orders in its own PostgreSQL database. Creating an order checks and decrements stock in the same transaction, then publishes a persistent `order.created` event to the durable RabbitMQ queue `order_notifications`. The publisher uses RabbitMQ's robust connection recovery; if publishing fails, order creation returns an error even though the order itself has already been saved.
+## What each service does
 
-The Order Service provides `POST /orders`, `GET /orders`, `GET /orders/{id}`, `POST /products`, `GET /products`, `GET /products/{id}`, and `GET /health`. Creating an order accepts `product_id` and `quantity`; `total_amount` is calculated from the product price. The Nginx gateway is the only application entry point exposed on the host, at `http://localhost:8080`; `/api/orders` routes to orders, `/api/inventory` routes to product management in Order Service, and `/api/notifications` routes to Notification Service.
+- **Order Service** owns products, stock, and orders. It checks and reduces stock when creating an order, then calls Notification Service over HTTP.
+- **Notification Service** accepts `order.created` requests and stores a notification such as `Order 1 created successfully`. Repeated requests for the same order do not create duplicate notifications.
+- **Nginx API Gateway** is the only container port exposed to the host. It routes `/api/orders/` to Order Service and `/api/notifications/` to Notification Service, removing the `/api/orders/` or `/api/notifications/` prefix so the FastAPI paths match.
 
-The Notification Service consumes `order.created` events from the durable `order_notifications` RabbitMQ queue and stores one notification per order in its own PostgreSQL database. It acknowledges an event only after it is stored (or recognized as a duplicate). Its API provides `GET /notifications`, `GET /notifications/{id}`, and `GET /health`.
+## REST communication
 
-Order Service and Notification Service each have their own PostgreSQL container, connection-string environment variable, and named volume. Inventory no longer runs as a separate container or database. The services use Docker's private bridge network and connect to databases using service names.
+Order Service sends a synchronous HTTP `POST` to `http://notification-service:8000/notifications` after saving an order. If Notification Service is unavailable, the order remains saved and the API returns an error explaining that notification creation failed. The order can be retrieved normally, and retrying the notification request with the same order ID is safe.
 
-## Local setup
+## Database per service
 
-1. Copy `.env.example` to `.env` (`Copy-Item .env.example .env` in PowerShell).
-2. Fill in the required values in `.env`. Generate strong credentials rather than using example/default passwords. Set the database URLs to use their Docker service names (`order-db:5432` and `notification-db:5432`); set `RABBITMQ_URL` to `amqp://<RABBITMQ_USER>:<RABBITMQ_PASSWORD>@rabbitmq:5672/`.
-3. Start the stack with `docker compose up --build`.
-4. Access the gateway at `http://localhost:8080`.
+Order Service connects to `order-db`, which stores products and orders. Notification Service connects to `notification-db`, which stores notifications. The databases have separate named volumes and do not share tables.
 
-Only the API gateway (`8080:80`) and RabbitMQ management UI (`15672:15672`) publish host ports. PostgreSQL and application service ports remain internal. All database and RabbitMQ credentials and connection URLs are supplied through `.env`; no development passwords are provided by the Compose configuration.
+## Docker Compose
+
+`compose.yaml` starts five containers: `api-gateway`, `order-service`, `notification-service`, `order-db`, and `notification-db`. They use the same Docker bridge network named `private`. Each database has its own named volume. Only the gateway publishes a host port: `8080`.
+
+Start the containers from the project root:
+
+```powershell
+docker compose up --build -d
+```
+
+Set PostgreSQL credentials and database URLs in `.env` before running Compose. The FastAPI services are not published as host ports.
+
+## Classroom demonstration
+
+Use `curl` (or `curl.exe` in Windows PowerShell).
+
+1. **Start Docker Compose** (if you have not already):
+
+   ```sh
+   docker compose up --build -d
+   ```
+
+2. **Check the containers**:
+
+   ```sh
+   docker compose ps
+   ```
+
+3. **Create an ESP32 product with stock 20**:
+
+   ```sh
+   curl -X POST http://localhost:8080/api/orders/products \
+     -H "Content-Type: application/json" \
+     -d '{"name":"ESP32","price":650,"stock":20}'
+   ```
+
+4. **Retrieve products**:
+
+   ```sh
+   curl http://localhost:8080/api/orders/products
+   ```
+
+5. **Create an order for 2 ESP32 units**:
+
+   ```sh
+   curl -X POST http://localhost:8080/api/orders/orders \
+     -H "Content-Type: application/json" \
+     -d '{"product_id":1,"quantity":2}'
+   ```
+
+6. **Retrieve products again** and see that stock changed from 20 to 18:
+
+   ```sh
+   curl http://localhost:8080/api/orders/products
+   ```
+
+7. **Retrieve orders**:
+
+   ```sh
+   curl http://localhost:8080/api/orders/orders
+   ```
+
+8. **Retrieve notifications**:
+
+   ```sh
+   curl http://localhost:8080/api/notifications/notifications
+   ```
+
+9. Explain the synchronous REST flow:
+
+   ```text
+   Order Service -> HTTP POST /notifications -> Notification Service
+   ```
+
+   Health checks are available at `/api/orders/health` and `/api/notifications/health`.

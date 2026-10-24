@@ -1,60 +1,88 @@
-"""Notification Service HTTP API and RabbitMQ consumer lifecycle."""
-
+import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .config import get_rabbitmq_url
-from .consumer import NotificationConsumer
-from .database import close_db, get_db, get_session_factory, init_db
+from .database import SessionLocal, create_tables, engine, get_db
 from .models import Notification
-from .schemas import NotificationResponse
+
+logging.basicConfig(level=logging.INFO)
+
+
+class OrderCreatedRequest(BaseModel):
+    event_type: str = Field(pattern=r"^order\.created$")
+    order_id: int = Field(gt=0)
+    product_id: int = Field(gt=0)
+    quantity: int = Field(gt=0)
+    total_amount: Decimal = Field(ge=0)
+
+
+class NotificationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    order_id: int
+    message: str
+    created_at: datetime
 
 
 @asynccontextmanager
-async def lifespan(application: FastAPI):
-    await init_db()
-    consumer = NotificationConsumer(get_rabbitmq_url(), get_session_factory())
+async def lifespan(_: FastAPI):
+    await create_tables()
     try:
-        await consumer.start()
-        application.state.notification_consumer = consumer
         yield
     finally:
-        try:
-            await consumer.close()
-        finally:
-            await close_db()
+        await engine.dispose()
 
 
 app = FastAPI(title="Notification Service", lifespan=lifespan)
-
-
-@app.get("/notifications", response_model=list[NotificationResponse])
-async def list_notifications(
-    db: AsyncSession = Depends(get_db),
-) -> list[Notification]:
-    result = await db.execute(
-        select(Notification).order_by(Notification.id)
-    )
-    return list(result.scalars().all())
-
-
-@app.get("/notifications/{notification_id}", response_model=NotificationResponse)
-async def get_notification(
-    notification_id: int,
-    db: AsyncSession = Depends(get_db),
-) -> Notification:
-    notification = await db.get(Notification, notification_id)
-    if notification is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Notification not found",
-        )
-    return notification
+Database = Annotated[AsyncSession, Depends(get_db)]
 
 
 @app.get("/health")
-def health_check() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, str]:
+    return {"status": "healthy"}
+
+
+@app.post("/notifications", response_model=NotificationResponse)
+async def create_notification(
+    event: OrderCreatedRequest,
+    db: Database,
+) -> Notification:
+    existing = await db.scalar(
+        select(Notification).where(Notification.order_id == event.order_id)
+    )
+    if existing is not None:
+        return existing
+
+    notification = Notification(
+        order_id=event.order_id,
+        message=f"Order {event.order_id} created successfully",
+    )
+    db.add(notification)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        existing = await db.scalar(
+            select(Notification).where(Notification.order_id == event.order_id)
+        )
+        if existing is None:
+            raise
+        return existing
+    await db.refresh(notification)
+    logging.info("Saved notification for order %s", event.order_id)
+    return notification
+
+
+@app.get("/notifications", response_model=list[NotificationResponse])
+async def list_notifications(db: Database) -> list[Notification]:
+    result = await db.scalars(select(Notification).order_by(Notification.id))
+    return list(result.all())

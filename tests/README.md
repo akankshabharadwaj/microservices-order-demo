@@ -1,3 +1,3 @@
 # Tests
 
-The Order Service and Inventory Service test suites are in their respective `tests` directories. Install a service's development dependencies with `pip install -r requirements-dev.txt` from that service directory, then run `pytest`.
+The service test suites are in the `tests` directories under `order-service` and `notification-service`. To run them, install `requirements-dev.txt` and run `python -m pytest` from the corresponding service directory.

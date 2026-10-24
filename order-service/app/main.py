@@ -1,50 +1,78 @@
-"""Order Service application entry point."""
-
 from contextlib import asynccontextmanager
+from decimal import Decimal
+import os
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .config import get_rabbitmq_url
-from .database import close_db, get_db, init_db
-from .messaging import OrderEventPublisher, RabbitMQPublishError
+from .database import create_tables, engine, get_db
 from .models import Order, Product
-from .schemas import OrderCreate, OrderResponse, ProductCreate, ProductResponse
+
+NOTIFICATION_SERVICE_URL = os.environ.get(
+    "NOTIFICATION_SERVICE_URL", "http://notification-service:8000"
+)
+
+
+class ProductCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    price: Decimal = Field(ge=0)
+    stock: int = Field(ge=0)
+
+
+class ProductResponse(BaseModel):
+    id: int
+    name: str
+    price: Decimal
+    stock: int
+
+
+class OrderCreate(BaseModel):
+    product_id: int = Field(gt=0)
+    quantity: int = Field(gt=0)
+
+
+class OrderResponse(BaseModel):
+    id: int
+    product_id: int
+    quantity: int
+    total_amount: Decimal
+    status: str
 
 
 @asynccontextmanager
-async def lifespan(application: FastAPI):
-    publisher = OrderEventPublisher(get_rabbitmq_url())
+async def lifespan(app: FastAPI):
+    await create_tables()
+    app.state.notification_client = httpx.AsyncClient(
+        base_url=NOTIFICATION_SERVICE_URL.rstrip("/"),
+        timeout=5.0,
+    )
     try:
-        await init_db()
-        application.state.order_event_publisher = publisher
         yield
     finally:
-        try:
-            await publisher.close()
-        finally:
-            await close_db()
+        await app.state.notification_client.aclose()
+        await engine.dispose()
 
 
 app = FastAPI(title="Order Service", lifespan=lifespan)
+Database = Annotated[AsyncSession, Depends(get_db)]
 
 
-def get_order_event_publisher(request: Request) -> OrderEventPublisher:
-    return request.app.state.order_event_publisher
+async def get_notification_client(request: Request) -> httpx.AsyncClient:
+    return request.app.state.notification_client
 
 
 @app.get("/health")
-def health_check() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, str]:
+    return {"status": "healthy"}
 
 
-@app.post("/products", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
-async def create_product(
-    product_data: ProductCreate,
-    db: AsyncSession = Depends(get_db),
-) -> Product:
-    product = Product(**product_data.model_dump())
+@app.post("/products", response_model=ProductResponse, status_code=201)
+async def create_product(data: ProductCreate, db: Database) -> Product:
+    product = Product(**data.model_dump())
     db.add(product)
     await db.commit()
     await db.refresh(product)
@@ -52,70 +80,58 @@ async def create_product(
 
 
 @app.get("/products", response_model=list[ProductResponse])
-async def list_products(db: AsyncSession = Depends(get_db)) -> list[Product]:
-    result = await db.execute(select(Product).order_by(Product.id))
-    return list(result.scalars().all())
+async def list_products(db: Database) -> list[Product]:
+    result = await db.scalars(select(Product).order_by(Product.id))
+    return list(result.all())
 
 
-@app.get("/products/{product_id}", response_model=ProductResponse)
-async def get_product(product_id: int, db: AsyncSession = Depends(get_db)) -> Product:
-    product = await db.get(Product, product_id)
-    if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    return product
-
-
-@app.post("/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+@app.post("/orders", response_model=OrderResponse, status_code=201)
 async def create_order(
-    order_data: OrderCreate,
-    db: AsyncSession = Depends(get_db),
-    event_publisher: OrderEventPublisher = Depends(get_order_event_publisher),
+    data: OrderCreate,
+    db: Database,
+    notification_client: Annotated[
+        httpx.AsyncClient, Depends(get_notification_client)
+    ],
 ) -> Order:
     async with db.begin():
-        result = await db.execute(
-            select(Product)
-            .where(Product.id == order_data.product_id)
-            .with_for_update()
+        product = await db.scalar(
+            select(Product).where(Product.id == data.product_id).with_for_update()
         )
-        product = result.scalar_one_or_none()
         if product is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Product not found",
-            )
-        if product.available_quantity < order_data.quantity:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Insufficient stock",
-            )
-        product.available_quantity -= order_data.quantity
+            raise HTTPException(status_code=404, detail="Product not found")
+        if product.stock < data.quantity:
+            raise HTTPException(status_code=409, detail="Insufficient stock")
+
+        product.stock -= data.quantity
         order = Order(
             product_id=product.id,
-            quantity=order_data.quantity,
-            total_amount=product.price * order_data.quantity,
+            quantity=data.quantity,
+            total_amount=product.price * data.quantity,
         )
         db.add(order)
     await db.refresh(order)
-    await db.refresh(order)
+
     try:
-        await event_publisher.publish_order_created(order)
-    except RabbitMQPublishError as exc:
+        response = await notification_client.post(
+            "/notifications",
+            json={
+                "event_type": "order.created",
+                "order_id": order.id,
+                "product_id": order.product_id,
+                "quantity": order.quantity,
+                "total_amount": str(order.total_amount),
+            },
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Order was created, but its event could not be published",
+            status_code=503,
+            detail="Order was created, but notification service failed",
         ) from exc
     return order
 
 
 @app.get("/orders", response_model=list[OrderResponse])
-async def list_orders(db: AsyncSession = Depends(get_db)) -> list[Order]:
-    result = await db.execute(select(Order).order_by(Order.id))
-    return list(result.scalars().all())
-
-
-@app.get("/orders/{order_id}", response_model=OrderResponse)
-async def get_order(order_id: int, db: AsyncSession = Depends(get_db)) -> Order:
-    order = await db.get(Order, order_id)
-    if order is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    return order
+async def list_orders(db: Database) -> list[Order]:
+    result = await db.scalars(select(Order).order_by(Order.id))
+    return list(result.all())
