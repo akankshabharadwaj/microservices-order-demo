@@ -180,10 +180,15 @@ volumes:
 
 networks:
   private:
+    name: private
+    driver: bridge
     internal: true
   order-data:
+    driver: bridge
     internal: true
   inventory-data:
+    driver: bridge
     internal: true
   notification-data:
+    driver: bridge
     internal: true
